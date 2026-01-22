@@ -1,12 +1,108 @@
-import express from 'express';
-const app = express();
+import express, { Request, Response } from "express";
+import cors from "cors";
 
-app.get('/', (req, res) => {
-  const name = process.env.NAME || 'World';
-  res.send(`Hello ${name}!`);
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+/* ======================================================
+   MODEL 1 — REUSABILITY CLASSIFICATION
+====================================================== */
+function classifyReusability(
+  ph: number,
+  turbidity: number,
+  tds: number
+): boolean {
+  if (ph < 6.5 || ph > 8.5) return false;
+  if (turbidity > 10) return false;
+  if (tds > 1000) return false;
+  return true;
+}
+
+/* ======================================================
+   MODEL 2 — FILTRATION BRACKET SELECTION
+====================================================== */
+function selectFiltrationBracket(turbidity: number, tds: number) {
+  if (tds > 1500) {
+    return { bracket: "F5", method: "Reverse Osmosis (RO)" };
+  }
+
+  if (tds >= 1000 && tds <= 1500) {
+    return { bracket: "F4", method: "Carbon + Ultrafiltration" };
+  }
+
+  if (turbidity > 30) {
+    return { bracket: "F3", method: "Coagulation + Sand Filtration" };
+  }
+
+  if (turbidity > 10) {
+    return { bracket: "F2", method: "Sand + Carbon + Cloth Filtration" };
+  }
+
+  return { bracket: "F1", method: "Sand + Activated Carbon" };
+}
+
+/* ======================================================
+   HEALTH CHECK
+====================================================== */
+app.get("/", (_req: Request, res: Response) => {
+  res.send("Water Quality Backend is running");
 });
 
-const port = parseInt(process.env.PORT || '3000');
-app.listen(port, () => {
-  console.log(`listening on port ${port}`);
+/* ======================================================
+   MAIN API
+====================================================== */
+app.post("/analyze-water", (req: Request, res: Response) => {
+  const { ph, turbidity, tds } = req.body as {
+    ph?: number;
+    turbidity?: number;
+    tds?: number;
+  };
+
+  if (ph === undefined || turbidity === undefined || tds === undefined) {
+    return res.status(400).json({
+      error: "Missing parameters. Required: ph, turbidity, tds"
+    });
+  }
+
+  const reusable = classifyReusability(ph, turbidity, tds);
+
+  if (reusable) {
+    return res.json({
+      status: "OK",
+      reusable: "YES",
+      tank: "Tank A",
+      filtrationBracket: "NONE",
+      filtrationMethod: "Basic Filtration Only",
+      explanation:
+        "All water quality parameters are within acceptable reuse limits."
+    });
+  }
+
+  const filtration = selectFiltrationBracket(turbidity, tds);
+
+  let note = "Water exceeds reuse limits and requires treatment.";
+  if (ph < 6.5 || ph > 8.5) {
+    note += " pH adjustment is recommended.";
+  }
+
+  return res.json({
+    status: "OK",
+    reusable: "NO",
+    tank: "Tank B",
+    filtrationBracket: filtration.bracket,
+    filtrationMethod: filtration.method,
+    explanation: note
+  });
+});
+
+/* ======================================================
+   SERVER START
+====================================================== */
+const PORT: number = process.env.PORT
+  ? parseInt(process.env.PORT)
+  : 8080;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Backend server running on port ${PORT}`);
 });
