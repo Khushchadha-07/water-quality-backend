@@ -146,4 +146,5 @@ app.post("/analyze-water", (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  co
+  console.log(`Backend server running on port ${PORT}`);
+});
