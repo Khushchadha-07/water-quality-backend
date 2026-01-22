@@ -1,97 +1,103 @@
-import React, { useState } from "react";
-import ReactDOM from "react-dom/client";
+import express, { Request, Response } from "express";
+import cors from "cors";
 
-type ApiResponse = {
-  status: string;
-  reusable: string;
-  tank: string;
-  filtrationBracket: string;
-  filtrationMethod: string;
-  explanation: string;
-};
+const app = express();
 
-function App() {
-  const [ph, setPh] = useState("");
-  const [turbidity, setTurbidity] = useState("");
-  const [tds, setTds] = useState("");
-  const [result, setResult] = useState<ApiResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+/* ===================== MIDDLEWARE ===================== */
+app.use(cors());
+app.use(express.json());
 
-  const analyzeWater = async () => {
-    setLoading(true);
-    setError("");
-    setResult(null);
-
-    try {
-      const response = await fetch(
-        "https://water-quality-backend-qxd3.onrender.com/analyze-water",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            ph: Number(ph),
-            turbidity: Number(turbidity),
-            tds: Number(tds)
-          })
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error("Backend error");
-      }
-
-      const data = await response.json();
-      setResult(data);
-    } catch (e) {
-      setError("Failed to analyze water");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div style={{ padding: "2rem", fontFamily: "Arial" }}>
-      <h1>Water Quality Monitoring System</h1>
-
-      <div>
-        <label>pH:</label>
-        <input value={ph} onChange={e => setPh(e.target.value)} />
-      </div>
-
-      <div>
-        <label>Turbidity:</label>
-        <input value={turbidity} onChange={e => setTurbidity(e.target.value)} />
-      </div>
-
-      <div>
-        <label>TDS:</label>
-        <input value={tds} onChange={e => setTds(e.target.value)} />
-      </div>
-
-      <button onClick={analyzeWater} disabled={loading}>
-        {loading ? "Analyzing..." : "Analyze Water"}
-      </button>
-
-      {error && <p style={{ color: "red" }}>{error}</p>}
-
-      {result && (
-        <div style={{ marginTop: "1rem", border: "1px solid #ccc", padding: "1rem" }}>
-          <p><b>Reusable:</b> {result.reusable}</p>
-          <p><b>Tank:</b> {result.tank}</p>
-          <p><b>Filtration Bracket:</b> {result.filtrationBracket}</p>
-          <p><b>Filtration Method:</b> {result.filtrationMethod}</p>
-          <p><b>Explanation:</b> {result.explanation}</p>
-        </div>
-      )}
-    </div>
-  );
+/* ===================== MODEL 1 =====================
+   Reusability Classification
+==================================================== */
+function classifyReusability(
+  ph: number,
+  turbidity: number,
+  tds: number
+): boolean {
+  if (ph < 6.5 || ph > 8.5) return false;
+  if (turbidity > 10) return false;
+  if (tds > 1000) return false;
+  return true;
 }
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
+/* ===================== MODEL 2 =====================
+   Filtration Bracket Selection
+==================================================== */
+function selectFiltrationBracket(
+  turbidity: number,
+  tds: number
+): { bracket: string; method: string } {
+  if (tds > 1500) {
+    return { bracket: "F5", method: "Reverse Osmosis (RO)" };
+  }
+
+  if (tds >= 1000) {
+    return { bracket: "F4", method: "Carbon + Ultrafiltration" };
+  }
+
+  if (turbidity > 30) {
+    return { bracket: "F3", method: "Coagulation + Sand Filtration" };
+  }
+
+  if (turbidity > 10) {
+    return { bracket: "F2", method: "Sand + Carbon + Cloth Filtration" };
+  }
+
+  return { bracket: "F1", method: "Sand + Activated Carbon" };
+}
+
+/* ===================== HEALTH CHECK ===================== */
+app.get("/", (_req: Request, res: Response) => {
+  res.send("Water Quality Backend is running");
+});
+
+/* ===================== MAIN API ===================== */
+app.post("/analyze-water", (req: Request, res: Response) => {
+  const { ph, turbidity, tds } = req.body;
+
+  if (
+    typeof ph !== "number" ||
+    typeof turbidity !== "number" ||
+    typeof tds !== "number"
+  ) {
+    return res.status(400).json({
+      error: "Invalid input. ph, turbidity, and tds must be numbers."
+    });
+  }
+
+  const reusable = classifyReusability(ph, turbidity, tds);
+
+  if (reusable) {
+    return res.json({
+      status: "OK",
+      reusable: "YES",
+      tank: "Tank A",
+      filtrationBracket: "NONE",
+      filtrationMethod: "Basic Filtration",
+      explanation:
+        "All parameters are within acceptable reuse limits."
+    });
+  }
+
+  const filtration = selectFiltrationBracket(turbidity, tds);
+
+  return res.json({
+    status: "OK",
+    reusable: "NO",
+    tank: "Tank B",
+    filtrationBracket: filtration.bracket,
+    filtrationMethod: filtration.method,
+    explanation:
+      "Water exceeds reuse limits and requires treatment before reuse."
+  });
+});
+
+/* ===================== SERVER START ===================== */
+const PORT: number = process.env.PORT
+  ? parseInt(process.env.PORT)
+  : 3000;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Backend server running on port ${PORT}`);
+});
