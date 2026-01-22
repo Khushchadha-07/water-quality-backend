@@ -9,52 +9,54 @@ app.use(cors());
 app.use(express.json());
 
 /* ===============================
-   DATASETS (STANDARDS-BASED)
+   DATASETS
 ================================ */
 
-/*
-Reusability thresholds
-(WHO / BIS simplified)
-*/
 const REUSABILITY_LIMITS = {
   ph: { min: 6.5, max: 8.5 },
-  turbidity: { max: 10 }, // NTU
-  tds: { max: 1000 } // ppm
+  turbidity: { max: 10 },
+  tds: { max: 1000 }
 };
 
-/*
-Filtration decision rules
-*/
-const FILTRATION_RULES = [
+type FiltrationResult = {
+  bracket: string;
+  method: string;
+};
+
+const FILTRATION_RULES: {
+  bracket: string;
+  method: string;
+  check: (tds: number, turbidity: number) => boolean;
+}[] = [
   {
     bracket: "F5",
     method: "Reverse Osmosis (RO)",
-    check: (tds: number, _t: number) => tds > 1500
+    check: (tds) => tds > 1500
   },
   {
     bracket: "F4",
     method: "Ultrafiltration + Activated Carbon",
-    check: (tds: number, _t: number) => tds > 1000
+    check: (tds) => tds > 1000
   },
   {
     bracket: "F3",
     method: "Coagulation + Sand Filtration",
-    check: (_tds: number, turbidity: number) => turbidity > 30
+    check: (_tds, turbidity) => turbidity > 30
   },
   {
     bracket: "F2",
     method: "Sand + Carbon + Cloth Filtration",
-    check: (_tds: number, turbidity: number) => turbidity > 10
+    check: (_tds, turbidity) => turbidity > 10
   },
   {
     bracket: "F1",
     method: "Sand + Activated Carbon",
-    check: (_tds: number, _t: number) => true
+    check: () => true
   }
 ];
 
 /* ===============================
-   MODEL 1: REUSABILITY CHECK
+   MODEL 1 — REUSABILITY
 ================================ */
 function isReusable(
   ph: number,
@@ -74,9 +76,12 @@ function isReusable(
 }
 
 /* ===============================
-   MODEL 2: FILTRATION SELECTION
+   MODEL 2 — FILTRATION
 ================================ */
-function selectFiltration(turbidity: number, tds: number) {
+function selectFiltration(
+  turbidity: number,
+  tds: number
+): FiltrationResult {
   for (const rule of FILTRATION_RULES) {
     if (rule.check(tds, turbidity)) {
       return {
@@ -85,22 +90,25 @@ function selectFiltration(turbidity: number, tds: number) {
       };
     }
   }
+
+  // ✅ SAFETY FALLBACK (never undefined)
+  return {
+    bracket: "UNKNOWN",
+    method: "Manual inspection required"
+  };
 }
 
 /* ===============================
-   HEALTH CHECK ROUTE
+   ROUTES
 ================================ */
+
 app.get("/", (_req: Request, res: Response) => {
   res.send("Water Quality Backend is running");
 });
 
-/* ===============================
-   MAIN API — USED BY FRONTEND
-================================ */
 app.post("/analyze-water", (req: Request, res: Response) => {
   const { ph, turbidity, tds } = req.body;
 
-  /* ---- Validation ---- */
   if (
     typeof ph !== "number" ||
     typeof turbidity !== "number" ||
@@ -112,7 +120,6 @@ app.post("/analyze-water", (req: Request, res: Response) => {
     });
   }
 
-  /* ---- Model 1 ---- */
   const reusable = isReusable(ph, turbidity, tds);
 
   if (reusable) {
@@ -127,15 +134,7 @@ app.post("/analyze-water", (req: Request, res: Response) => {
     });
   }
 
-  /* ---- Model 2 ---- */
   const filtration = selectFiltration(turbidity, tds);
-
-  let explanation =
-    "Water exceeds reuse thresholds and requires treatment.";
-
-  if (ph < REUSABILITY_LIMITS.ph.min || ph > REUSABILITY_LIMITS.ph.max) {
-    explanation += " pH correction is recommended.";
-  }
 
   return res.json({
     status: "OK",
@@ -143,7 +142,8 @@ app.post("/analyze-water", (req: Request, res: Response) => {
     tank: "Tank B",
     filtrationBracket: filtration.bracket,
     filtrationMethod: filtration.method,
-    explanation
+    explanation:
+      "Water exceeds reuse limits and requires treatment before reuse."
   });
 });
 
