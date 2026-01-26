@@ -9,6 +9,7 @@ app.use(express.json());
    CONFIG
 ================================ */
 const WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const MIN_BATCH_SIZE = 10;
 
 /* ===============================
    TYPES
@@ -20,21 +21,30 @@ type SensorReading = {
   timestamp: number;
 };
 
-/* ===============================
-   IN-MEMORY BUFFER
-================================ */
-let readings: SensorReading[] = [];
+type SessionState = {
+  active: boolean;
+  startedAt: number | null;
+};
 
 /* ===============================
-   HELPER FUNCTIONS
+   IN-MEMORY STORAGE
+================================ */
+let rawReadings: SensorReading[] = []; // always growing (windowed)
+let sessionReadings: SensorReading[] = []; // ONLY valid batch
+let session: SessionState = {
+  active: false,
+  startedAt: null,
+};
+
+/* ===============================
+   HELPERS
 ================================ */
 function pruneOldReadings() {
   const cutoff = Date.now() - WINDOW_MS;
-  readings = readings.filter(r => r.timestamp >= cutoff);
+  rawReadings = rawReadings.filter(r => r.timestamp >= cutoff);
 }
 
-function computeAverage() {
-  pruneOldReadings();
+function computeAverage(readings: SensorReading[]) {
   if (readings.length === 0) return null;
 
   const sum = readings.reduce(
@@ -50,7 +60,7 @@ function computeAverage() {
   return {
     ph: +(sum.ph / readings.length).toFixed(2),
     turbidity: +(sum.turbidity / readings.length).toFixed(2),
-    tds: Math.round(sum.tds / readings.length)
+    tds: Math.round(sum.tds / readings.length),
   };
 }
 
@@ -82,10 +92,10 @@ app.get("/", (_req: Request, res: Response) => {
   res.send("Water Quality Backend running");
 });
 
-/* ===============================
-   SENSOR INGEST (ESP / MANUAL)
-================================ */
-app.post("/sensor/data", (req: Request, res: Response) => {
+/* ======================================================
+   1️⃣ INGEST — ESP SENDS DATA ALWAYS
+====================================================== */
+app.post("/ingest", (req: Request, res: Response) => {
   const { ph, turbidity, tds } = req.body;
 
   if (
@@ -96,77 +106,111 @@ app.post("/sensor/data", (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid sensor data" });
   }
 
-  readings.push({
+  const reading: SensorReading = {
     ph,
     turbidity,
     tds,
-    timestamp: Date.now()
-  });
+    timestamp: Date.now(),
+  };
 
+  rawReadings.push(reading);
   pruneOldReadings();
 
-  res.json({ status: "stored", count: readings.length });
-});
-
-/* ===============================
-   RAW CONTINUOUS DATA (LAPTOP)
-================================ */
-app.get("/sensor/raw", (_req: Request, res: Response) => {
-  pruneOldReadings();
-  res.json({
-    window: "last 5 minutes",
-    count: readings.length,
-    readings
-  });
-});
-
-/* ===============================
-   AVERAGED DATA (PHONE / REPORT)
-================================ */
-app.get("/sensor/average", (_req: Request, res: Response) => {
-  const avg = computeAverage();
-  if (!avg) {
-    return res.status(404).json({ error: "No data available" });
+  // ONLY store in session buffer if session is active
+  if (session.active) {
+    sessionReadings.push(reading);
   }
 
   res.json({
-    window: "5 minutes",
-    average: avg
+    status: "ingested",
+    sessionActive: session.active,
+    rawCount: rawReadings.length,
+    sessionCount: sessionReadings.length,
   });
 });
 
-/* ===============================
-   ANALYSIS (PREDICTION MODEL)
-================================ */
-app.post("/analyze-water", (req: Request, res: Response) => {
-  const { ph, turbidity, tds } = req.body;
+/* ======================================================
+   2️⃣ LATEST — FRONTEND LIVE VIEW
+====================================================== */
+app.get("/latest", (_req: Request, res: Response) => {
+  pruneOldReadings();
 
-  if (
-    typeof ph !== "number" ||
-    typeof turbidity !== "number" ||
-    typeof tds !== "number"
-  ) {
+  const latest = rawReadings[rawReadings.length - 1] || null;
+
+  res.json({
+    sessionActive: session.active,
+    latest,
+  });
+});
+
+/* ======================================================
+   3️⃣ SESSION START — THE GATE
+====================================================== */
+app.post("/session/start", (_req: Request, res: Response) => {
+  session.active = true;
+  session.startedAt = Date.now();
+  sessionReadings = []; // 🔥 wipe garbage
+
+  res.json({
+    status: "session_started",
+    startedAt: session.startedAt,
+  });
+});
+
+/* ======================================================
+   4️⃣ SESSION STATUS (DEBUG / UI)
+====================================================== */
+app.get("/session/status", (_req: Request, res: Response) => {
+  res.json({
+    active: session.active,
+    startedAt: session.startedAt,
+    batchSize: sessionReadings.length,
+  });
+});
+
+/* ======================================================
+   5️⃣ ANALYSIS — DECISION + PUMP LOGIC
+====================================================== */
+app.post("/analyze-water", (_req: Request, res: Response) => {
+  if (!session.active) {
     return res.status(400).json({
-      error: "ph, turbidity, and tds must be numbers"
+      error: "Session not started. Deploy Live Sensors first.",
     });
   }
 
-  const reusable = isReusable(ph, turbidity, tds);
+  if (sessionReadings.length < MIN_BATCH_SIZE) {
+    return res.status(400).json({
+      error: "Not enough data for analysis",
+      required: MIN_BATCH_SIZE,
+      current: sessionReadings.length,
+    });
+  }
+
+  const avg = computeAverage(sessionReadings);
+  if (!avg) {
+    return res.status(500).json({ error: "Average failed" });
+  }
+
+  const reusable = isReusable(avg.ph, avg.turbidity, avg.tds);
 
   if (reusable) {
     return res.json({
       reusable: "YES",
       tank: "Tank A",
-      filtrationBracket: "F1"
+      filtrationBracket: "F1",
+      average: avg,
+      pump: "PUMP_A_ON",
     });
   }
 
-  const bracket = filtrationBracket(turbidity, tds);
+  const bracket = filtrationBracket(avg.turbidity, avg.tds);
 
   return res.json({
     reusable: "NO",
     tank: "Tank B",
-    filtrationBracket: bracket
+    filtrationBracket: bracket,
+    average: avg,
+    pump: "PUMP_B_ON",
   });
 });
 
