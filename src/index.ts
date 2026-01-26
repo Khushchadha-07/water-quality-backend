@@ -8,8 +8,7 @@ app.use(express.json());
 /* ===============================
    CONFIG
 ================================ */
-const WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-const MIN_BATCH_SIZE = 10;
+const BATCH_SIZE = 10;
 
 /* ===============================
    TYPES
@@ -23,30 +22,37 @@ type SensorReading = {
 
 type SessionState = {
   active: boolean;
+  completed: boolean;
   startedAt: number | null;
 };
 
+type TankLevels = {
+  tankA: number; // percentage 0–100
+  tankB: number; // percentage 0–100
+  updatedAt: number | null;
+};
+
 /* ===============================
-   IN-MEMORY STORAGE
+   IN-MEMORY STATE
 ================================ */
-let rawReadings: SensorReading[] = []; // always growing (windowed)
-let sessionReadings: SensorReading[] = []; // ONLY valid batch
+let sessionReadings: SensorReading[] = [];
+
 let session: SessionState = {
   active: false,
+  completed: false,
   startedAt: null,
+};
+
+let tankLevels: TankLevels = {
+  tankA: 0,
+  tankB: 0,
+  updatedAt: null,
 };
 
 /* ===============================
    HELPERS
 ================================ */
-function pruneOldReadings() {
-  const cutoff = Date.now() - WINDOW_MS;
-  rawReadings = rawReadings.filter(r => r.timestamp >= cutoff);
-}
-
 function computeAverage(readings: SensorReading[]) {
-  if (readings.length === 0) return null;
-
   const sum = readings.reduce(
     (acc, r) => {
       acc.ph += r.ph;
@@ -88,12 +94,12 @@ function filtrationBracket(turbidity: number, tds: number): string {
 /* ===============================
    HEALTH CHECK
 ================================ */
-app.get("/", (_req: Request, res: Response) => {
-  res.send("Water Quality Backend running");
+app.get("/", (_req, res) => {
+  res.send("Water IQ Backend Running");
 });
 
 /* ======================================================
-   1️⃣ INGEST — ESP SENDS DATA ALWAYS
+   1️⃣ INGEST — ESP WATER QUALITY DATA
 ====================================================== */
 app.post("/ingest", (req: Request, res: Response) => {
   const { ph, turbidity, tds } = req.body;
@@ -106,92 +112,85 @@ app.post("/ingest", (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid sensor data" });
   }
 
-  const reading: SensorReading = {
-    ph,
-    turbidity,
-    tds,
-    timestamp: Date.now(),
-  };
-
-  rawReadings.push(reading);
-  pruneOldReadings();
-
-  // ONLY store in session buffer if session is active
-  if (session.active) {
-    sessionReadings.push(reading);
+  if (session.active && !session.completed) {
+    sessionReadings.push({
+      ph,
+      turbidity,
+      tds,
+      timestamp: Date.now(),
+    });
   }
 
   res.json({
-    status: "ingested",
+    status: "received",
     sessionActive: session.active,
-    rawCount: rawReadings.length,
     sessionCount: sessionReadings.length,
   });
 });
 
 /* ======================================================
-   2️⃣ LATEST — FRONTEND LIVE VIEW
-====================================================== */
-app.get("/latest", (_req: Request, res: Response) => {
-  pruneOldReadings();
-
-  const latest = rawReadings[rawReadings.length - 1] || null;
-
-  res.json({
-    sessionActive: session.active,
-    latest,
-  });
-});
-
-/* ======================================================
-   3️⃣ SESSION START — THE GATE
+   2️⃣ SESSION START — FRONTEND GATE
 ====================================================== */
 app.post("/session/start", (_req: Request, res: Response) => {
   session.active = true;
+  session.completed = false;
   session.startedAt = Date.now();
-  sessionReadings = []; // 🔥 wipe garbage
+  sessionReadings = [];
 
   res.json({
     status: "session_started",
-    startedAt: session.startedAt,
+    batchSize: BATCH_SIZE,
   });
 });
 
 /* ======================================================
-   4️⃣ SESSION STATUS (DEBUG / UI)
+   3️⃣ SESSION RESET — MANUAL / AUTO RESET
+====================================================== */
+app.post("/session/reset", (_req: Request, res: Response) => {
+  session.active = false;
+  session.completed = false;
+  session.startedAt = null;
+  sessionReadings = [];
+
+  res.json({
+    status: "session_reset",
+  });
+});
+
+/* ======================================================
+   4️⃣ SESSION STATUS
 ====================================================== */
 app.get("/session/status", (_req: Request, res: Response) => {
   res.json({
     active: session.active,
-    startedAt: session.startedAt,
-    batchSize: sessionReadings.length,
+    completed: session.completed,
+    collected: sessionReadings.length,
   });
 });
 
 /* ======================================================
-   5️⃣ ANALYSIS — DECISION + PUMP LOGIC
+   5️⃣ ANALYZE + PUMP DECISION
 ====================================================== */
 app.post("/analyze-water", (_req: Request, res: Response) => {
   if (!session.active) {
     return res.status(400).json({
-      error: "Session not started. Deploy Live Sensors first.",
+      error: "Session not started",
     });
   }
 
-  if (sessionReadings.length < MIN_BATCH_SIZE) {
+  if (sessionReadings.length < BATCH_SIZE) {
     return res.status(400).json({
-      error: "Not enough data for analysis",
-      required: MIN_BATCH_SIZE,
+      error: "Insufficient data",
+      required: BATCH_SIZE,
       current: sessionReadings.length,
     });
   }
 
   const avg = computeAverage(sessionReadings);
-  if (!avg) {
-    return res.status(500).json({ error: "Average failed" });
-  }
-
   const reusable = isReusable(avg.ph, avg.turbidity, avg.tds);
+
+  session.completed = true;
+  session.active = false;
 
   if (reusable) {
     return res.json({
@@ -199,7 +198,7 @@ app.post("/analyze-water", (_req: Request, res: Response) => {
       tank: "Tank A",
       filtrationBracket: "F1",
       average: avg,
-      pump: "PUMP_A_ON",
+      pumpCommand: "PUMP_A_ON",
     });
   }
 
@@ -210,8 +209,41 @@ app.post("/analyze-water", (_req: Request, res: Response) => {
     tank: "Tank B",
     filtrationBracket: bracket,
     average: avg,
-    pump: "PUMP_B_ON",
+    pumpCommand: "PUMP_B_ON",
   });
+});
+
+/* ======================================================
+   6️⃣ ULTRASONIC INGEST — TANK LEVELS (ESP)
+====================================================== */
+app.post("/tank-levels/ingest", (req: Request, res: Response) => {
+  const { tankA, tankB } = req.body;
+
+  if (
+    typeof tankA !== "number" ||
+    typeof tankB !== "number" ||
+    tankA < 0 || tankA > 100 ||
+    tankB < 0 || tankB > 100
+  ) {
+    return res.status(400).json({ error: "Invalid tank levels" });
+  }
+
+  tankLevels = {
+    tankA,
+    tankB,
+    updatedAt: Date.now(),
+  };
+
+  res.json({
+    status: "tank_levels_updated",
+  });
+});
+
+/* ======================================================
+   7️⃣ ULTRASONIC FETCH — FRONTEND DISPLAY
+====================================================== */
+app.get("/tank-levels", (_req: Request, res: Response) => {
+  res.json(tankLevels);
 });
 
 /* ===============================
