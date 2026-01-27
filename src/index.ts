@@ -169,6 +169,31 @@ app.get("/session/status", (_req: Request, res: Response) => {
 });
 
 /* ======================================================
+   4️⃣B SESSION READINGS — LIVE TELEMETRY (FRONTEND)
+====================================================== */
+app.get("/session/readings", (_req: Request, res: Response) => {
+  if (!session.active && sessionReadings.length === 0) {
+    return res.json({
+      active: false,
+      collected: 0,
+      readings: [],
+      average: null,
+    });
+  }
+
+  const avg =
+    sessionReadings.length > 0 ? computeAverage(sessionReadings) : null;
+
+  res.json({
+    active: session.active,
+    completed: session.completed,
+    collected: sessionReadings.length,
+    readings: sessionReadings,
+    average: avg,
+  });
+});
+
+/* ======================================================
    5️⃣ ANALYZE + PUMP DECISION
 ====================================================== */
 app.post("/analyze-water", (_req: Request, res: Response) => {
