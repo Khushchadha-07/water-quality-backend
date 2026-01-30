@@ -1,7 +1,7 @@
 {
   "name": "water-quality-backend",
   "version": "1.0.0",
-  "type": "module",
+  "description": "IoT backend for water quality monitoring and pump control",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
