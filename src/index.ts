@@ -113,6 +113,9 @@ app.get("/", (_req, res) => {
   res.send("Water IQ Backend Running");
 });
 
+
+
+
 /* ======================================================
    1️⃣ INGEST SENSOR DATA (ESP)
 ====================================================== */
@@ -126,6 +129,15 @@ app.post("/ingest", (req, res) => {
   ) {
     return res.status(400).json({ error: "Invalid sensor data" });
   }
+
+// 🔧 AUTO-START COLLECTION IF ESP SENDS DATA
+if (systemPhase === "IDLE") {
+  systemPhase = "COLLECTING";
+  session.active = true;
+  session.completed = false;
+   session.startedAt = Date.now();
+}
+   
 if (sessionReadings.length >= BATCH_SIZE) {
   return res.json({
     status: "ignored",
@@ -238,6 +250,8 @@ app.post("/analyze-water", (_req, res) => {
   session.completed = true;
   systemPhase = "ANALYZED";
 
+sessionReadings = [];
+   
   res.json({ ...lastPrediction, average: avg });
 });
 
@@ -271,7 +285,7 @@ app.post("/pump/command", (req, res) => {
 
   // 🔧 FIX: correct phase transitions
   if (command === "STOP_ALL") {
-    systemPhase = "IDLE";
+    systemPhase = "COMPLETE";
   } else if (command === "START_PUMP_C") {
     systemPhase = "POST_FILTRATION";
   } else {
