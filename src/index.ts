@@ -26,11 +26,19 @@ type SessionState = {
   startedAt: number | null;
 };
 
-type PumpState = {
-  pumpA: boolean; // Main → Tank A (Reusable)
-  pumpB: boolean; // Main → Tank B (Discard)
-  pumpC: boolean; // Tank A → Tank C (Post-filtration)
-};
+type SystemPhase =
+  | "IDLE"
+  | "COLLECTING"
+  | "ANALYZED"
+  | "TRANSFERRING_MAIN"
+  | "POST_FILTRATION"
+  | "COMPLETE";
+
+type PumpCommand =
+  | "START_PUMP_A"
+  | "START_PUMP_B"
+  | "START_PUMP_C"
+  | "STOP_ALL";
 
 type PredictionResult = {
   bracket: "F1" | "F2" | "F3" | "F4" | "F5";
@@ -51,13 +59,12 @@ let session: SessionState = {
   startedAt: null,
 };
 
-let pumpState: PumpState = {
-  pumpA: false,
-  pumpB: false,
-  pumpC: false,
-};
+let systemPhase: SystemPhase = "IDLE";
 
 let lastPrediction: PredictionResult | null = null;
+
+let pendingPumpCommand: PumpCommand | null = null;
+let commandDelivered = false; // 🔧 FIX: prevent repeated execution
 
 /* ===============================
    HELPERS
@@ -80,9 +87,6 @@ function computeAverage(readings: SensorReading[]) {
   };
 }
 
-/* ===============================
-   FILTRATION BRACKET
-================================ */
 function filtrationBracket(turbidity: number, tds: number): PredictionResult["bracket"] {
   if (tds > 1500) return "F5";
   if (tds >= 1000) return "F4";
@@ -93,18 +97,12 @@ function filtrationBracket(turbidity: number, tds: number): PredictionResult["br
 
 function filtrationMethod(bracket: string): string {
   switch (bracket) {
-    case "F1":
-      return "Sediment + Carbon polishing";
-    case "F2":
-      return "Sand + Carbon filtration";
-    case "F3":
-      return "Coagulation + Sand filtration";
-    case "F4":
-      return "Ultrafiltration (not reusable)";
-    case "F5":
-      return "RO / Advanced treatment (discard)";
-    default:
-      return "Unknown";
+    case "F1": return "Sediment + Carbon polishing";
+    case "F2": return "Sand + Carbon filtration";
+    case "F3": return "Coagulation + Sand filtration";
+    case "F4": return "Advanced treatment (discard)";
+    case "F5": return "RO / Disposal";
+    default: return "Unknown";
   }
 }
 
@@ -118,7 +116,7 @@ app.get("/", (_req, res) => {
 /* ======================================================
    1️⃣ INGEST SENSOR DATA (ESP)
 ====================================================== */
-app.post("/ingest", (req: Request, res: Response) => {
+app.post("/ingest", (req, res) => {
   const { ph, turbidity, tds } = req.body;
 
   if (
@@ -129,7 +127,8 @@ app.post("/ingest", (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid sensor data" });
   }
 
-  if (session.active && !session.completed) {
+  // ✅ Only collect during COLLECTING phase
+  if (systemPhase === "COLLECTING") {
     sessionReadings.push({
       ph,
       turbidity,
@@ -141,6 +140,7 @@ app.post("/ingest", (req: Request, res: Response) => {
   res.json({
     status: "received",
     collected: sessionReadings.length,
+    phase: systemPhase,
   });
 });
 
@@ -148,11 +148,14 @@ app.post("/ingest", (req: Request, res: Response) => {
    2️⃣ SESSION CONTROL
 ====================================================== */
 app.post("/session/start", (_req, res) => {
+  sessionReadings = [];
   session.active = true;
   session.completed = false;
   session.startedAt = Date.now();
-  sessionReadings = [];
+  systemPhase = "COLLECTING";
   lastPrediction = null;
+  pendingPumpCommand = null;
+  commandDelivered = false;
 
   res.json({ status: "session_started", batchSize: BATCH_SIZE });
 });
@@ -162,7 +165,10 @@ app.post("/session/reset", (_req, res) => {
   session.completed = false;
   session.startedAt = null;
   sessionReadings = [];
+  systemPhase = "IDLE";
   lastPrediction = null;
+  pendingPumpCommand = null;
+  commandDelivered = false;
 
   res.json({ status: "session_reset" });
 });
@@ -172,27 +178,17 @@ app.get("/session/status", (_req, res) => {
     active: session.active,
     completed: session.completed,
     collected: sessionReadings.length,
-  });
-});
-
-app.get("/session/readings", (_req, res) => {
-  const avg =
-    sessionReadings.length > 0 ? computeAverage(sessionReadings) : null;
-
-  res.json({
-    active: session.active,
-    completed: session.completed,
-    readings: sessionReadings,
-    average: avg,
+    phase: systemPhase,
   });
 });
 
 /* ======================================================
-   3️⃣ ANALYZE WATER (CORE LOGIC)
+   3️⃣ ANALYZE WATER
 ====================================================== */
 app.post("/analyze-water", (_req, res) => {
-  if (!session.active) {
-    return res.status(400).json({ error: "Session not started" });
+  // 🔧 FIX: prevent re-analysis
+  if (systemPhase !== "COLLECTING") {
+    return res.status(400).json({ error: "Session not active" });
   }
 
   if (sessionReadings.length < BATCH_SIZE) {
@@ -217,17 +213,15 @@ app.post("/analyze-water", (_req, res) => {
     decidedAt: Date.now(),
   };
 
-  session.completed = true;
   session.active = false;
+  session.completed = true;
+  systemPhase = "ANALYZED";
 
-  res.json({
-    ...lastPrediction,
-    average: avg,
-  });
+  res.json({ ...lastPrediction, average: avg });
 });
 
 /* ======================================================
-   4️⃣ PREDICTION FETCH (FRONTEND + ESP LCD)
+   4️⃣ PREDICTION FETCH
 ====================================================== */
 app.get("/prediction/latest", (_req, res) => {
   if (!lastPrediction) {
@@ -237,38 +231,56 @@ app.get("/prediction/latest", (_req, res) => {
 });
 
 /* ======================================================
-   5️⃣ PUMP CONTROL (MANUAL, FRONTEND)
+   5️⃣ EVENT-BASED PUMP COMMANDS
 ====================================================== */
-app.post("/pump/on", (req: Request, res: Response) => {
-  const { pump } = req.body;
+app.post("/pump/command", (req, res) => {
+  const { command } = req.body;
 
-  if (!["A", "B", "C"].includes(pump)) {
-    return res.status(400).json({ error: "Invalid pump" });
+  if (!["START_PUMP_A", "START_PUMP_B", "START_PUMP_C", "STOP_ALL"].includes(command)) {
+    return res.status(400).json({ error: "Invalid command" });
   }
 
-  pumpState = {
-    pumpA: pump === "A",
-    pumpB: pump === "B",
-    pumpC: pump === "C",
-  };
-
-  res.json({ status: "pump_on", pumpState });
-});
-
-app.post("/pump/off", (req: Request, res: Response) => {
-  const { pump } = req.body;
-
-  if (!["A", "B", "C"].includes(pump)) {
-    return res.status(400).json({ error: "Invalid pump" });
+  // 🔧 FIX: STOP_ALL allowed anytime
+  if (systemPhase !== "ANALYZED" && command !== "STOP_ALL") {
+    return res.status(400).json({ error: "Invalid system phase" });
   }
 
-  pumpState[`pump${pump}` as keyof PumpState] = false;
+  pendingPumpCommand = command;
+  commandDelivered = false;
 
-  res.json({ status: "pump_off", pumpState });
+  // 🔧 FIX: correct phase transitions
+  if (command === "STOP_ALL") {
+    systemPhase = "ANALYZED";
+  } else if (command === "START_PUMP_C") {
+    systemPhase = "POST_FILTRATION";
+  } else {
+    systemPhase = "TRANSFERRING_MAIN";
+  }
+
+  res.json({ status: "command_queued", command });
 });
 
-app.get("/pump/status", (_req, res) => {
-  res.json(pumpState);
+/* ======================================================
+   6️⃣ ESP FETCHES COMMAND (ONE-TIME)
+====================================================== */
+app.get("/pump/command", (_req, res) => {
+  if (!pendingPumpCommand || commandDelivered) {
+    return res.json({ command: null });
+  }
+
+  commandDelivered = true;
+  res.json({ command: pendingPumpCommand });
+});
+
+/* ======================================================
+   7️⃣ ESP ACKNOWLEDGES COMMAND
+====================================================== */
+app.post("/pump/ack", (_req, res) => {
+  pendingPumpCommand = null;
+  commandDelivered = false;
+  systemPhase = "COMPLETE";
+
+  res.json({ status: "acknowledged" });
 });
 
 /* ===============================
