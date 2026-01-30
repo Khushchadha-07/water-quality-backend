@@ -26,15 +26,18 @@ type SessionState = {
   startedAt: number | null;
 };
 
-type TankLevels = {
-  tankA: number; // percentage 0–100
-  tankB: number; // percentage 0–100
-  updatedAt: number | null;
+type PumpState = {
+  pumpA: boolean; // Main → Tank A (Reusable)
+  pumpB: boolean; // Main → Tank B (Discard)
+  pumpC: boolean; // Tank A → Tank C (Post-filtration)
 };
 
-type PumpState = {
-  pumpA: boolean;
-  pumpB: boolean;
+type PredictionResult = {
+  bracket: "F1" | "F2" | "F3" | "F4" | "F5";
+  reusable: boolean;
+  suggestedTank: "A" | "B";
+  filtrationMethod: string;
+  decidedAt: number;
 };
 
 /* ===============================
@@ -48,16 +51,13 @@ let session: SessionState = {
   startedAt: null,
 };
 
-let tankLevels: TankLevels = {
-  tankA: 0,
-  tankB: 0,
-  updatedAt: null,
-};
-
 let pumpState: PumpState = {
   pumpA: false,
   pumpB: false,
+  pumpC: false,
 };
+
+let lastPrediction: PredictionResult | null = null;
 
 /* ===============================
    HELPERS
@@ -81,19 +81,9 @@ function computeAverage(readings: SensorReading[]) {
 }
 
 /* ===============================
-   MODEL 1 — REUSABILITY
+   FILTRATION BRACKET
 ================================ */
-function isReusable(ph: number, turbidity: number, tds: number): boolean {
-  if (ph < 6.5 || ph > 8.5) return false;
-  if (turbidity > 10) return false;
-  if (tds > 1000) return false;
-  return true;
-}
-
-/* ===============================
-   MODEL 2 — FILTRATION BRACKET
-================================ */
-function filtrationBracket(turbidity: number, tds: number): string {
+function filtrationBracket(turbidity: number, tds: number): PredictionResult["bracket"] {
   if (tds > 1500) return "F5";
   if (tds >= 1000) return "F4";
   if (turbidity > 30) return "F3";
@@ -101,15 +91,32 @@ function filtrationBracket(turbidity: number, tds: number): string {
   return "F1";
 }
 
+function filtrationMethod(bracket: string): string {
+  switch (bracket) {
+    case "F1":
+      return "Sediment + Carbon polishing";
+    case "F2":
+      return "Sand + Carbon filtration";
+    case "F3":
+      return "Coagulation + Sand filtration";
+    case "F4":
+      return "Ultrafiltration (not reusable)";
+    case "F5":
+      return "RO / Advanced treatment (discard)";
+    default:
+      return "Unknown";
+  }
+}
+
 /* ===============================
-   HEALTH CHECK
+   HEALTH
 ================================ */
 app.get("/", (_req, res) => {
   res.send("Water IQ Backend Running");
 });
 
 /* ======================================================
-   1️⃣ INGEST — ESP WATER QUALITY DATA
+   1️⃣ INGEST SENSOR DATA (ESP)
 ====================================================== */
 app.post("/ingest", (req: Request, res: Response) => {
   const { ph, turbidity, tds } = req.body;
@@ -133,44 +140,34 @@ app.post("/ingest", (req: Request, res: Response) => {
 
   res.json({
     status: "received",
-    sessionActive: session.active,
-    sessionCount: sessionReadings.length,
+    collected: sessionReadings.length,
   });
 });
 
 /* ======================================================
-   2️⃣ SESSION START — FRONTEND GATE
+   2️⃣ SESSION CONTROL
 ====================================================== */
-app.post("/session/start", (_req: Request, res: Response) => {
+app.post("/session/start", (_req, res) => {
   session.active = true;
   session.completed = false;
   session.startedAt = Date.now();
   sessionReadings = [];
+  lastPrediction = null;
 
-  res.json({
-    status: "session_started",
-    batchSize: BATCH_SIZE,
-  });
+  res.json({ status: "session_started", batchSize: BATCH_SIZE });
 });
 
-/* ======================================================
-   3️⃣ SESSION RESET
-====================================================== */
-app.post("/session/reset", (_req: Request, res: Response) => {
+app.post("/session/reset", (_req, res) => {
   session.active = false;
   session.completed = false;
   session.startedAt = null;
   sessionReadings = [];
+  lastPrediction = null;
 
-  res.json({
-    status: "session_reset",
-  });
+  res.json({ status: "session_reset" });
 });
 
-/* ======================================================
-   4️⃣ SESSION STATUS
-====================================================== */
-app.get("/session/status", (_req: Request, res: Response) => {
+app.get("/session/status", (_req, res) => {
   res.json({
     active: session.active,
     completed: session.completed,
@@ -178,26 +175,22 @@ app.get("/session/status", (_req: Request, res: Response) => {
   });
 });
 
-/* ======================================================
-   5️⃣ SESSION READINGS — LIVE VIEW
-====================================================== */
-app.get("/session/readings", (_req: Request, res: Response) => {
+app.get("/session/readings", (_req, res) => {
   const avg =
     sessionReadings.length > 0 ? computeAverage(sessionReadings) : null;
 
   res.json({
     active: session.active,
     completed: session.completed,
-    collected: sessionReadings.length,
     readings: sessionReadings,
     average: avg,
   });
 });
 
 /* ======================================================
-   6️⃣ ANALYZE WATER — SUGGEST TANK ONLY
+   3️⃣ ANALYZE WATER (CORE LOGIC)
 ====================================================== */
-app.post("/analyze-water", (_req: Request, res: Response) => {
+app.post("/analyze-water", (_req, res) => {
   if (!session.active) {
     return res.status(400).json({ error: "Session not started" });
   }
@@ -211,101 +204,75 @@ app.post("/analyze-water", (_req: Request, res: Response) => {
   }
 
   const avg = computeAverage(sessionReadings);
-  const reusable = isReusable(avg.ph, avg.turbidity, avg.tds);
+  const bracket = filtrationBracket(avg.turbidity, avg.tds);
+
+  const reusable = bracket === "F1" || bracket === "F2";
+  const suggestedTank = reusable ? "A" : "B";
+
+  lastPrediction = {
+    bracket,
+    reusable,
+    suggestedTank,
+    filtrationMethod: filtrationMethod(bracket),
+    decidedAt: Date.now(),
+  };
 
   session.completed = true;
   session.active = false;
 
-  if (reusable) {
-    return res.json({
-      reusable: "YES",
-      suggestedTank: "A",
-      filtrationBracket: "F1",
-      average: avg,
-    });
-  }
-
-  return res.json({
-    reusable: "NO",
-    suggestedTank: "B",
-    filtrationBracket: filtrationBracket(avg.turbidity, avg.tds),
+  res.json({
+    ...lastPrediction,
     average: avg,
   });
 });
 
 /* ======================================================
-   7️⃣ MANUAL PUMP CONTROL — ON
+   4️⃣ PREDICTION FETCH (FRONTEND + ESP LCD)
+====================================================== */
+app.get("/prediction/latest", (_req, res) => {
+  if (!lastPrediction) {
+    return res.status(404).json({ error: "No prediction available" });
+  }
+  res.json(lastPrediction);
+});
+
+/* ======================================================
+   5️⃣ PUMP CONTROL (MANUAL, FRONTEND)
 ====================================================== */
 app.post("/pump/on", (req: Request, res: Response) => {
-  const { tank } = req.body;
+  const { pump } = req.body;
 
-  if (tank !== "A" && tank !== "B") {
-    return res.status(400).json({ error: "Invalid tank selection" });
+  if (!["A", "B", "C"].includes(pump)) {
+    return res.status(400).json({ error: "Invalid pump" });
   }
 
-  pumpState.pumpA = tank === "A";
-  pumpState.pumpB = tank === "B";
+  pumpState = {
+    pumpA: pump === "A",
+    pumpB: pump === "B",
+    pumpC: pump === "C",
+  };
 
-  res.json({
-    status: "pump_on",
-    activePump: tank,
-    pumpState,
-  });
+  res.json({ status: "pump_on", pumpState });
 });
 
-/* ======================================================
-   8️⃣ MANUAL PUMP CONTROL — OFF
-====================================================== */
-app.post("/pump/off", (_req: Request, res: Response) => {
-  pumpState.pumpA = false;
-  pumpState.pumpB = false;
+app.post("/pump/off", (req: Request, res: Response) => {
+  const { pump } = req.body;
 
-  res.json({
-    status: "pump_off",
-    pumpState,
-  });
+  if (!["A", "B", "C"].includes(pump)) {
+    return res.status(400).json({ error: "Invalid pump" });
+  }
+
+  pumpState[`pump${pump}` as keyof PumpState] = false;
+
+  res.json({ status: "pump_off", pumpState });
 });
 
-/* ======================================================
-   9️⃣ PUMP STATUS — ESP + FRONTEND POLL
-====================================================== */
-app.get("/pump/status", (_req: Request, res: Response) => {
+app.get("/pump/status", (_req, res) => {
   res.json(pumpState);
 });
 
-/* ======================================================
-   10️⃣ (OPTIONAL) TANK LEVEL INGEST
-====================================================== */
-app.post("/tank-levels/ingest", (req: Request, res: Response) => {
-  const { tankA, tankB } = req.body;
-
-  if (
-    typeof tankA !== "number" ||
-    typeof tankB !== "number" ||
-    tankA < 0 || tankA > 100 ||
-    tankB < 0 || tankB > 100
-  ) {
-    return res.status(400).json({ error: "Invalid tank levels" });
-  }
-
-  tankLevels = {
-    tankA,
-    tankB,
-    updatedAt: Date.now(),
-  };
-
-  res.json({ status: "tank_levels_updated" });
-});
-
-/* ======================================================
-   11️⃣ (OPTIONAL) TANK LEVEL FETCH
-====================================================== */
-app.get("/tank-levels", (_req: Request, res: Response) => {
-  res.json(tankLevels);
-});
-
 /* ===============================
-   SERVER START
+   SERVER
 ================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
