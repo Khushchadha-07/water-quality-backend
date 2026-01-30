@@ -32,6 +32,11 @@ type TankLevels = {
   updatedAt: number | null;
 };
 
+type PumpState = {
+  pumpA: boolean;
+  pumpB: boolean;
+};
+
 /* ===============================
    IN-MEMORY STATE
 ================================ */
@@ -47,6 +52,11 @@ let tankLevels: TankLevels = {
   tankA: 0,
   tankB: 0,
   updatedAt: null,
+};
+
+let pumpState: PumpState = {
+  pumpA: false,
+  pumpB: false,
 };
 
 /* ===============================
@@ -144,7 +154,7 @@ app.post("/session/start", (_req: Request, res: Response) => {
 });
 
 /* ======================================================
-   3️⃣ SESSION RESET — MANUAL / AUTO RESET
+   3️⃣ SESSION RESET
 ====================================================== */
 app.post("/session/reset", (_req: Request, res: Response) => {
   session.active = false;
@@ -169,18 +179,9 @@ app.get("/session/status", (_req: Request, res: Response) => {
 });
 
 /* ======================================================
-   4️⃣B SESSION READINGS — LIVE TELEMETRY (FRONTEND)
+   5️⃣ SESSION READINGS — LIVE VIEW
 ====================================================== */
 app.get("/session/readings", (_req: Request, res: Response) => {
-  if (!session.active && sessionReadings.length === 0) {
-    return res.json({
-      active: false,
-      collected: 0,
-      readings: [],
-      average: null,
-    });
-  }
-
   const avg =
     sessionReadings.length > 0 ? computeAverage(sessionReadings) : null;
 
@@ -194,13 +195,11 @@ app.get("/session/readings", (_req: Request, res: Response) => {
 });
 
 /* ======================================================
-   5️⃣ ANALYZE + PUMP DECISION
+   6️⃣ ANALYZE WATER — SUGGEST TANK ONLY
 ====================================================== */
 app.post("/analyze-water", (_req: Request, res: Response) => {
   if (!session.active) {
-    return res.status(400).json({
-      error: "Session not started",
-    });
+    return res.status(400).json({ error: "Session not started" });
   }
 
   if (sessionReadings.length < BATCH_SIZE) {
@@ -220,26 +219,62 @@ app.post("/analyze-water", (_req: Request, res: Response) => {
   if (reusable) {
     return res.json({
       reusable: "YES",
-      tank: "Tank A",
+      suggestedTank: "A",
       filtrationBracket: "F1",
       average: avg,
-      pumpCommand: "PUMP_A_ON",
     });
   }
 
-  const bracket = filtrationBracket(avg.turbidity, avg.tds);
-
   return res.json({
     reusable: "NO",
-    tank: "Tank B",
-    filtrationBracket: bracket,
+    suggestedTank: "B",
+    filtrationBracket: filtrationBracket(avg.turbidity, avg.tds),
     average: avg,
-    pumpCommand: "PUMP_B_ON",
   });
 });
 
 /* ======================================================
-   6️⃣ ULTRASONIC INGEST — TANK LEVELS (ESP)
+   7️⃣ MANUAL PUMP CONTROL — ON
+====================================================== */
+app.post("/pump/on", (req: Request, res: Response) => {
+  const { tank } = req.body;
+
+  if (tank !== "A" && tank !== "B") {
+    return res.status(400).json({ error: "Invalid tank selection" });
+  }
+
+  pumpState.pumpA = tank === "A";
+  pumpState.pumpB = tank === "B";
+
+  res.json({
+    status: "pump_on",
+    activePump: tank,
+    pumpState,
+  });
+});
+
+/* ======================================================
+   8️⃣ MANUAL PUMP CONTROL — OFF
+====================================================== */
+app.post("/pump/off", (_req: Request, res: Response) => {
+  pumpState.pumpA = false;
+  pumpState.pumpB = false;
+
+  res.json({
+    status: "pump_off",
+    pumpState,
+  });
+});
+
+/* ======================================================
+   9️⃣ PUMP STATUS — ESP + FRONTEND POLL
+====================================================== */
+app.get("/pump/status", (_req: Request, res: Response) => {
+  res.json(pumpState);
+});
+
+/* ======================================================
+   10️⃣ (OPTIONAL) TANK LEVEL INGEST
 ====================================================== */
 app.post("/tank-levels/ingest", (req: Request, res: Response) => {
   const { tankA, tankB } = req.body;
@@ -259,13 +294,11 @@ app.post("/tank-levels/ingest", (req: Request, res: Response) => {
     updatedAt: Date.now(),
   };
 
-  res.json({
-    status: "tank_levels_updated",
-  });
+  res.json({ status: "tank_levels_updated" });
 });
 
 /* ======================================================
-   7️⃣ ULTRASONIC FETCH — FRONTEND DISPLAY
+   11️⃣ (OPTIONAL) TANK LEVEL FETCH
 ====================================================== */
 app.get("/tank-levels", (_req: Request, res: Response) => {
   res.json(tankLevels);
