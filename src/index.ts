@@ -126,7 +126,14 @@ app.post("/ingest", (req, res) => {
   ) {
     return res.status(400).json({ error: "Invalid sensor data" });
   }
-
+if (sessionReadings.length >= BATCH_SIZE) {
+  return res.json({
+    status: "ignored",
+    reason: "batch_complete",
+    collected: sessionReadings.length,
+    phase: systemPhase,
+  });
+}
   // ✅ Only collect during COLLECTING phase
   if (systemPhase === "COLLECTING") {
     sessionReadings.push({
@@ -182,14 +189,28 @@ app.get("/session/status", (_req, res) => {
   });
 });
 
+app.get("/session/readings", (_req, res) => {
+  res.json({
+    readings: sessionReadings.map(r => ({
+      ph: r.ph,
+      turbidity: r.turbidity,
+      tds: r.tds,
+      timestamp: r.timestamp,
+    })),
+  });
+});
+
 /* ======================================================
    3️⃣ ANALYZE WATER
 ====================================================== */
 app.post("/analyze-water", (_req, res) => {
   // 🔧 FIX: prevent re-analysis
-  if (systemPhase !== "COLLECTING") {
-    return res.status(400).json({ error: "Session not active" });
-  }
+ if (systemPhase !== "COLLECTING") {
+  return res.status(400).json({
+    error: "Analysis not allowed in current phase",
+    phase: systemPhase,
+  });
+}
 
   if (sessionReadings.length < BATCH_SIZE) {
     return res.status(400).json({
@@ -250,7 +271,7 @@ app.post("/pump/command", (req, res) => {
 
   // 🔧 FIX: correct phase transitions
   if (command === "STOP_ALL") {
-    systemPhase = "ANALYZED";
+    systemPhase = "IDLE";
   } else if (command === "START_PUMP_C") {
     systemPhase = "POST_FILTRATION";
   } else {
@@ -278,7 +299,7 @@ app.get("/pump/command", (_req, res) => {
 app.post("/pump/ack", (_req, res) => {
   pendingPumpCommand = null;
   commandDelivered = false;
-  systemPhase = "COMPLETE";
+  systemPhase = "IDLE";
 
   res.json({ status: "acknowledged" });
 });
